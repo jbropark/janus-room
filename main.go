@@ -4,10 +4,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
-	"errors"
 
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
@@ -35,49 +35,59 @@ func watchHandle(handle *janus.Handle) {
 	}
 }
 
-func subscriber(session *janus.Session, room int64, feeds []float64) {
-	peerConnection := createNewPeerConnection()
-	// We must offer to send media for Janus to send anything
-	if _, err := peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	}); err != nil {
-		panic(err)
-	} else if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	}); err != nil {
+func watchPubHandle(pubHandle *janus.Handle, peerConnection *webrtc.PeerConnection, handle *janus.Handle, room int64, feeds []float64) {
+	// wait for event
+	initialized := initSubscriber(peerConnection, handle, room, feeds)
+	for {
+		msg := <-pubHandle.Events
+		switch msg := msg.(type) {
+		case *janus.SlowLinkMsg:
+			log.Println("SlowLinkMsg type ", handle.ID)
+		case *janus.MediaMsg:
+			log.Println("MediaEvent type", msg.Type, "receiving", msg.Receiving)
+		case *janus.WebRTCUpMsg:
+			log.Println("WebRTCUp type ", handle.ID)
+		case *janus.HangupMsg:
+			log.Println("HangupEvent type ", handle.ID)
+		case *janus.EventMsg:
+			log.Printf("EventMsg %+v", msg.Plugindata.Data)
+			feeds, err := publishersToFeeds(msg.Plugindata.Data["publishers"])
+			if err != nil {
+				panic(err)
+			}
+			if !initialized {
+				initialized = initSubscriber(peerConnection, handle, room, feeds)
+			} else {
+				subscribeNew(peerConnection, handle, feeds)
+			}
+		}
+	}
+}
+
+func subscribeNew(peerConnection *webrtc.PeerConnection, handle *janus.Handle, feeds []float64) {
+	fmt.Printf("New subscribe")
+	streams := feedsToStreams(feeds)
+	msg, err := handle.Message(map[string]interface{}{
+		"request": "subscribe",
+		"streams": streams,
+	}, nil)
+	if err != nil {
 		panic(err)
 	}
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		fmt.Printf("Got new track\n")
-	})
+	acceptOffer(peerConnection, handle, msg)
+}
 
-
-	fmt.Printf("feeds: %+v\n", feeds)
-	if len(feeds) == 0 {
-		return
-	}
-
+func feedsToStreams(feeds []float64) []map[string]interface{} {
 	var streams []map[string]interface{}
 	for _, feed := range feeds {
 		streams = append(streams, map[string]interface{}{
 			"feed": feed,
 		})
 	}
-	handle, err := session.Attach("janus.plugin.videoroom")
-	if err != nil {
-		panic(err)
-	}
-	go watchHandle(handle)
-	msg, err := handle.Message(map[string]interface{}{
-		"request": "join",
-		"ptype":   "subscriber",
-		"room":    room,
-		"streams": streams,
-	}, nil)
-	if err != nil {
-		panic(err)
-	}
+	return streams
+}
 
+func acceptOffer(peerConnection *webrtc.PeerConnection, handle *janus.Handle, msg *janus.EventMsg) {
 	sdpVal, ok := msg.Jsep["sdp"].(string)
 	if !ok {
 		panic("failed to cast")
@@ -85,10 +95,10 @@ func subscriber(session *janus.Session, room int64, feeds []float64) {
 
 	offer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
-		SDP: sdpVal,
+		SDP:  sdpVal,
 	}
 
-	if err = peerConnection.SetRemoteDescription(offer); err != nil {
+	if err := peerConnection.SetRemoteDescription(offer); err != nil {
 		panic(err)
 	}
 
@@ -98,29 +108,46 @@ func subscriber(session *janus.Session, room int64, feeds []float64) {
 		panic(answerErr)
 	}
 
-	if err = peerConnection.SetLocalDescription(answer); err != nil {
+	if err := peerConnection.SetLocalDescription(answer); err != nil {
 		panic(err)
 	}
 
 	<-gatherComplete
 
-	msg, err = handle.Message(map[string]interface{}{
+	_, err := handle.Message(map[string]interface{}{
 		"request": "start",
 	}, map[string]interface{}{
-		"type": "answer",
-		"sdp": peerConnection.LocalDescription().SDP,
+		"type":    "answer",
+		"sdp":     peerConnection.LocalDescription().SDP,
 		"trickle": false,
 	})
 
-	fmt.Printf("start msg: %+v\n", msg)
 	if err != nil {
 		panic(err)
 	}
-
-	select {}
 }
 
-func publishersToFeeds(publishers interface{}) ([]float64, error){
+func initSubscriber(peerConnection *webrtc.PeerConnection, handle *janus.Handle, room int64, feeds []float64) bool {
+	if len(feeds) == 0 {
+		return false
+	}
+
+	streams := feedsToStreams(feeds)
+	msg, err := handle.Message(map[string]interface{}{
+		"request": "join",
+		"ptype":   "subscriber",
+		"room":    room,
+		"streams": streams,
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+	acceptOffer(peerConnection, handle, msg)
+
+	return true
+}
+
+func publishersToFeeds(publishers interface{}) ([]float64, error) {
 	casted, ok := publishers.([]interface{})
 	if !ok {
 		return nil, errors.New("publishers not array")
@@ -163,17 +190,23 @@ func createNewPeerConnection() *webrtc.PeerConnection {
 
 func main() {
 	gst.Init(nil)
-	// Everything below is the Pion WebRTC API! Thanks for using it ❤️.
-	peerConnection := createNewPeerConnection()
 
-	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+	now := time.Now()
+	userId := now.UnixMilli() % (1 << 31)
+	fmt.Printf("UserId: %+v\n", userId)
+	const roomId = 1234
+
+	// Everything below is the Pion WebRTC API! Thanks for using it ❤️.
+	pubPeerConnection := createNewPeerConnection()
+
+	pubPeerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("Connection State has changed %s \n", connectionState.String())
 	})
 	// Create a audio track
 	opusTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "audio/opus"}, "audio", "pion")
 	if err != nil {
 		panic(err)
-	} else if _, err = peerConnection.AddTrack(opusTrack); err != nil {
+	} else if _, err = pubPeerConnection.AddTrack(opusTrack); err != nil {
 		panic(err)
 	}
 
@@ -181,19 +214,19 @@ func main() {
 	vp8Track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion")
 	if err != nil {
 		panic(err)
-	} else if _, err = peerConnection.AddTrack(vp8Track); err != nil {
+	} else if _, err = pubPeerConnection.AddTrack(vp8Track); err != nil {
 		panic(err)
 	}
 
-	offer, err := peerConnection.CreateOffer(nil)
+	offer, err := pubPeerConnection.CreateOffer(nil)
 	if err != nil {
 		panic(err)
 	}
 
 	// Create channel that is blocked until ICE Gathering is complete
-	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	gatherComplete := webrtc.GatheringCompletePromise(pubPeerConnection)
 
-	if err = peerConnection.SetLocalDescription(offer); err != nil {
+	if err = pubPeerConnection.SetLocalDescription(offer); err != nil {
 		panic(err)
 	}
 
@@ -202,6 +235,22 @@ func main() {
 	// in a production application you should exchange ICE Candidates via OnICECandidate
 	<-gatherComplete
 
+	subPeerConnection := createNewPeerConnection()
+	// We must offer to send media for Janus to send anything
+	if _, err := subPeerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	}); err != nil {
+		panic(err)
+	} else if _, err = subPeerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	}); err != nil {
+		panic(err)
+	}
+	subPeerConnection.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		fmt.Printf("Got new track\n")
+	})
+
+	/* Create Janus */
 	gateway, err := janus.Connect("ws://192.168.1.13:8188/janus")
 	if err != nil {
 		panic(err)
@@ -212,7 +261,12 @@ func main() {
 		panic(err)
 	}
 
-	handle, err := session.Attach("janus.plugin.videoroom")
+	pubHandle, err := session.Attach("janus.plugin.videoroom")
+	if err != nil {
+		panic(err)
+	}
+
+	subHandle, err := session.Attach("janus.plugin.videoroom")
 	if err != nil {
 		panic(err)
 	}
@@ -227,14 +281,10 @@ func main() {
 		}
 	}()
 
-	go watchHandle(handle)
+	go watchHandle(subHandle)
 
-	now := time.Now()
-	userId := now.UnixMilli() % (1 << 31) 
-	fmt.Printf("UserId: %+v\n", userId)
-	const roomId = 1234
-
-	joinMsg, err := handle.Message(map[string]interface{}{
+	/* Init Publisher */
+	joinMsg, err := pubHandle.Message(map[string]interface{}{
 		"request": "join",
 		"ptype":   "publisher",
 		"room":    roomId,
@@ -244,21 +294,22 @@ func main() {
 		panic(err)
 	}
 
+	/* Init Subscriber */
 	publishers := joinMsg.Plugindata.Data["publishers"]
 	feeds, err := publishersToFeeds(publishers)
 	if err != nil {
 		panic(err)
 	}
-	go subscriber(session, roomId, feeds)
+	go watchPubHandle(pubHandle, subPeerConnection, subHandle, roomId, feeds)
 
-	msg, err := handle.Message(map[string]interface{}{
+	msg, err := pubHandle.Message(map[string]interface{}{
 		"request": "publish",
 		"audio":   true,
 		"video":   true,
 		"data":    false,
 	}, map[string]interface{}{
 		"type":    "offer",
-		"sdp":     peerConnection.LocalDescription().SDP,
+		"sdp":     pubPeerConnection.LocalDescription().SDP,
 		"trickle": false,
 	})
 	if err != nil {
@@ -270,7 +321,7 @@ func main() {
 		if !ok {
 			panic("failed to cast")
 		}
-		err = peerConnection.SetRemoteDescription(webrtc.SessionDescription{
+		err = pubPeerConnection.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeAnswer,
 			SDP:  sdpVal,
 		})
@@ -336,6 +387,7 @@ func pipelineVideo(track *webrtc.TrackLocalStaticSample, filename string) {
 }
 
 func pipelineAudio(track *webrtc.TrackLocalStaticSample, filename string) {
+	/* Does not work */
 	pipelineStr := fmt.Sprintf("filesrc location=%s ! oggdemux ! appsink name=appsink", filename)
 
 	pipeline, err := gst.NewPipelineFromString(pipelineStr)
