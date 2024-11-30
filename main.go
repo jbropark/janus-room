@@ -4,17 +4,32 @@
 package main
 
 import (
+	"context"
+	"encoding/csv"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
 	janus "github.com/notedit/janus-go"
-	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/stats"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v3/pkg/media"
+	"github.com/pion/webrtc/v3/pkg/media/ivfwriter"
+	"github.com/pion/webrtc/v3/pkg/media/oggwriter"
 )
+
+var wg sync.WaitGroup
 
 func watchHandle(handle *janus.Handle) {
 	// wait for event
@@ -168,36 +183,219 @@ func publishersToFeeds(publishers interface{}) ([]float64, error) {
 	return feeds, nil
 }
 
-func createNewPeerConnection() *webrtc.PeerConnection {
-	// Prepare the configuration
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
+var config = webrtc.Configuration{
+	ICEServers: []webrtc.ICEServer{
+		{
+			URLs: []string{"stun:stun.l.google.com:19302"},
 		},
-		SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
+	},
+	SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
+}
+
+func readToDiscard(track *webrtc.TrackRemote) {
+	for {
+		_, _, err := track.ReadRTP()
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func saveToDisk(ctx context.Context, writer media.Writer, track *webrtc.TrackRemote) {
+	channel := make(chan struct {
+		*rtp.Packet
+		error
+	})
+	go func() {
+		for {
+			packet, _, err := track.ReadRTP()
+			channel <- struct {
+				*rtp.Packet
+				error
+			}{packet, err}
+		}
+	}()
+	defer func() {
+		if err := writer.Close(); err != nil {
+			panic(err)
+		}
+		fmt.Printf("[%s] Finished saving to disk\n", track.ID())
+		wg.Done()
+	}()
+	wg.Add(1)
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("[%s] Stop saving to disk\n", track.ID())
+			return
+		case r := <-channel:
+			if r.error != nil {
+				panic(r.error)
+			}
+
+			if err := writer.WriteRTP(r.Packet); err != nil {
+				panic(err)
+			}
+		}
+	}
+}
+
+func saveOpusToDisk(ctx context.Context, track *webrtc.TrackRemote, path string) {
+	codec := track.Codec()
+	if len(path) == 0 {
+		readToDiscard(track)
+		return
 	}
 
-	// Create a new RTCPeerConnection
-	peerConnection, err := webrtc.NewPeerConnection(config)
+	writer, err := oggwriter.New(path, codec.ClockRate, codec.Channels)
+	if err != nil {
+		panic(err)
+	}
+	saveToDisk(ctx, writer, track)
+}
+
+func saveVP8ToDisk(ctx context.Context, track *webrtc.TrackRemote, path string) {
+	if len(path) == 0 {
+		readToDiscard(track)
+		return
+	}
+
+	writer, err := ivfwriter.New(path)
+	if err != nil {
+		panic(err)
+	}
+	saveToDisk(ctx, writer, track)
+}
+
+var statsGetter stats.Getter
+
+var BENCH_COLUMN_NAMES = []string{"track", "kind", "last_received_dt", "packet_received", "packet_lost", "jitter", "nack_count"}
+
+var benchMutex sync.Mutex
+
+func writeBench(writer *csv.Writer, trackID string, kind string, inbound stats.InboundRTPStreamStats) {
+	benchMutex.Lock()
+	defer benchMutex.Unlock()
+
+	values := []string{
+		trackID,
+		kind,
+		inbound.LastPacketReceivedTimestamp.Format("2006-01-02T15:04:05.000000"),
+		strconv.FormatUint(inbound.PacketsReceived, 10),
+		strconv.FormatInt(inbound.PacketsLost, 10),
+		strconv.FormatFloat(inbound.Jitter, 'f', -1, 64),
+		strconv.FormatUint(uint64(inbound.NACKCount), 10),
+	}
+	writer.Write(values)
+}
+
+func saveBench(ctx context.Context, track *webrtc.TrackRemote, writer *csv.Writer, interval int) {
+	trackID := track.ID()
+
+	defer func() {
+		fmt.Printf("[%s] Finished writing bench\n", trackID)
+		wg.Done()
+	}()
+	wg.Add(1)
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+
+	count := 0
+	ssrc := uint32(track.SSRC())
+	kind := track.Kind().String()
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("[%s] Stop saving bench\n", trackID)
+			return
+		case <-ticker.C:
+			stats := statsGetter.Get(ssrc)
+			inbound := stats.InboundRTPStreamStats
+
+			writeBench(writer, trackID, kind, inbound)
+
+			count += 1
+			fmt.Printf("[%s] (%d / -) %v\n", trackID, count, inbound)
+
+			/*
+				inbound.PacketsReceived
+				inbound.PacketsLost
+				inbound.Jitter
+				inbound.LastPacketReceivedTimestamp
+				inbound.HeaderBytesReceived
+				inbound.BytesReceived
+				inbound.NACKCount
+			*/
+		}
+	}
+}
+
+func createWebRTCAPI(engine *webrtc.MediaEngine, registry *interceptor.Registry) *webrtc.API {
+	if err := engine.RegisterDefaultCodecs(); err != nil {
+		panic(err)
+	}
+
+	statsInterceptorFactory, err := stats.NewInterceptor()
 	if err != nil {
 		panic(err)
 	}
 
-	return peerConnection
+	statsInterceptorFactory.OnNewPeerConnection(func(_ string, getter stats.Getter) {
+		statsGetter = getter
+	})
+	registry.Add(statsInterceptorFactory)
+
+	if err = webrtc.RegisterDefaultInterceptors(engine, registry); err != nil {
+		panic(err)
+	}
+
+	return webrtc.NewAPI(webrtc.WithMediaEngine(engine), webrtc.WithInterceptorRegistry(registry))
 }
 
 func main() {
+	argHost := flag.String("host", "192.168.1.13", "janus ip")
+	argPort := flag.Int("port", 8188, "janus websocket port")
+	argRoomID := flag.Int("room", 1234, "target room id")
+	argBench := flag.Bool("bench", false, "enable bench")
+	argAudio := flag.Bool("audio", false, "enable audio")
+	argVideo := flag.Bool("video", false, "enable video")
+
+	/*d
+	argBenchPath := flag.String("o", "bench.csv", "output bench path")
+	argBenchInterval := flag.Int("interval", 0, "bench sample interval")
+	*/
+
+	flag.Parse()
+
 	gst.Init(nil)
 
+	cancelChan := make(chan os.Signal)
+	ctx, cancel := context.WithCancel(context.Background())
+
 	now := time.Now()
-	userId := now.UnixMilli() % (1 << 31)
-	fmt.Printf("UserId: %+v\n", userId)
-	const roomId = 1234
+	userID := now.UnixMilli() % (1 << 31)
+	fmt.Printf("UserId: %+v\n", userID)
+
+	roomID := int64(*argRoomID)
+	url := fmt.Sprintf("ws://%s:%d/", *argHost, *argPort)
+
+	benchPath := os.DevNull
+	if *argBench {
+		benchPath = fmt.Sprintf("bench-%d.csv", userID)
+	}
+
+	// WebRTC
+	var engine webrtc.MediaEngine
+	var registry interceptor.Registry
+	api := createWebRTCAPI(&engine, &registry)
 
 	// Everything below is the Pion WebRTC API! Thanks for using it ❤️.
-	pubPeerConnection := createNewPeerConnection()
+	pubPeerConnection, err := api.NewPeerConnection(config)
+	if err != nil {
+		panic(err)
+	}
 
 	pubPeerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("Connection State has changed %s \n", connectionState.String())
@@ -235,7 +433,11 @@ func main() {
 	// in a production application you should exchange ICE Candidates via OnICECandidate
 	<-gatherComplete
 
-	subPeerConnection := createNewPeerConnection()
+	subPeerConnection, err := api.NewPeerConnection(config)
+	if err != nil {
+		panic(err)
+	}
+
 	// We must offer to send media for Janus to send anything
 	if _, err := subPeerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
@@ -246,12 +448,9 @@ func main() {
 	}); err != nil {
 		panic(err)
 	}
-	subPeerConnection.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		fmt.Printf("Got new track\n")
-	})
 
 	/* Create Janus */
-	gateway, err := janus.Connect("ws://192.168.1.13:8188/janus")
+	gateway, err := janus.Connect(url)
 	if err != nil {
 		panic(err)
 	}
@@ -271,6 +470,41 @@ func main() {
 		panic(err)
 	}
 
+	// init bench csv
+	benchFile, err := os.Create(benchPath)
+	if err != nil {
+		panic(err)
+	}
+	defer benchFile.Close()
+
+	benchWriter := csv.NewWriter(benchFile)
+	defer benchWriter.Flush()
+
+	benchWriter.Write(BENCH_COLUMN_NAMES)
+
+	subPeerConnection.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		go saveBench(ctx, track, benchWriter, 5)
+
+		codec := track.Codec()
+		trackID := track.ID()
+		fmt.Printf("[%d] Got TrackRemote %s(%s, rtx=%t)\n", subHandle.ID, trackID, codec.MimeType, track.HasRTX())
+		if codec.MimeType == "audio/opus" {
+			path := ""
+			if *argAudio {
+				path = fmt.Sprintf("audio-%d-%s.ogg", userID, trackID)
+			}
+			saveOpusToDisk(ctx, track, path)
+		} else if codec.MimeType == "video/VP8" {
+			path := ""
+			if *argVideo {
+				path = fmt.Sprintf("video-%d-%s.ivf", userID, trackID)
+			}
+			saveVP8ToDisk(ctx, track, path)
+		} else {
+			fmt.Printf("[%s] Unknown codec: %s\n", track.ID(), codec.MimeType)
+		}
+	})
+
 	go func() {
 		for {
 			if _, keepAliveErr := session.KeepAlive(); keepAliveErr != nil {
@@ -287,8 +521,8 @@ func main() {
 	joinMsg, err := pubHandle.Message(map[string]interface{}{
 		"request": "join",
 		"ptype":   "publisher",
-		"room":    roomId,
-		"id":      userId,
+		"room":    roomID,
+		"id":      userID,
 	}, nil)
 	if err != nil {
 		panic(err)
@@ -300,7 +534,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	go watchPubHandle(pubHandle, subPeerConnection, subHandle, roomId, feeds)
+	go watchPubHandle(pubHandle, subPeerConnection, subHandle, roomID, feeds)
 
 	msg, err := pubHandle.Message(map[string]interface{}{
 		"request": "publish",
@@ -336,7 +570,16 @@ func main() {
 		pipelineVideo(vp8Track, "room.mkv")
 	}
 
-	select {}
+	// start sigint notify
+	signal.Notify(cancelChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// wait signal
+	sig := <-cancelChan
+	fmt.Printf("Got Signal %v: clean up...\n", sig)
+	gateway.Close()
+	cancel()
+	wg.Wait()
+	fmt.Printf("Done!\n")
 }
 
 func playPipeline(track *webrtc.TrackLocalStaticSample, pipeline *gst.Pipeline) {
