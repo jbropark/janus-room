@@ -1,16 +1,13 @@
 // SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
 // SPDX-License-Identifier: MIT
 
-//go:build !js
-// +build !js
-
-// example of how to connect Pion and Janus
 package main
 
 import (
 	"fmt"
 	"log"
 	"time"
+	"errors"
 
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
@@ -27,7 +24,7 @@ func watchHandle(handle *janus.Handle) {
 		case *janus.SlowLinkMsg:
 			log.Println("SlowLinkMsg type ", handle.ID)
 		case *janus.MediaMsg:
-			log.Println("MediaEvent type", msg.Type, " receiving ", msg.Receiving)
+			log.Println("MediaEvent type", msg.Type, "receiving", msg.Receiving)
 		case *janus.WebRTCUpMsg:
 			log.Println("WebRTCUp type ", handle.ID)
 		case *janus.HangupMsg:
@@ -38,10 +35,113 @@ func watchHandle(handle *janus.Handle) {
 	}
 }
 
-func main() {
-	gst.Init(nil)
-	// Everything below is the Pion WebRTC API! Thanks for using it ❤️.
+func subscriber(session *janus.Session, room int64, feeds []float64) {
+	peerConnection := createNewPeerConnection()
+	// We must offer to send media for Janus to send anything
+	if _, err := peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	}); err != nil {
+		panic(err)
+	} else if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	}); err != nil {
+		panic(err)
+	}
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		fmt.Printf("Got new track\n")
+	})
 
+
+	fmt.Printf("feeds: %+v\n", feeds)
+	if len(feeds) == 0 {
+		return
+	}
+
+	var streams []map[string]interface{}
+	for _, feed := range feeds {
+		streams = append(streams, map[string]interface{}{
+			"feed": feed,
+		})
+	}
+	handle, err := session.Attach("janus.plugin.videoroom")
+	if err != nil {
+		panic(err)
+	}
+	go watchHandle(handle)
+	msg, err := handle.Message(map[string]interface{}{
+		"request": "join",
+		"ptype":   "subscriber",
+		"room":    room,
+		"streams": streams,
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	sdpVal, ok := msg.Jsep["sdp"].(string)
+	if !ok {
+		panic("failed to cast")
+	}
+
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP: sdpVal,
+	}
+
+	if err = peerConnection.SetRemoteDescription(offer); err != nil {
+		panic(err)
+	}
+
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	answer, answerErr := peerConnection.CreateAnswer(nil)
+	if answerErr != nil {
+		panic(answerErr)
+	}
+
+	if err = peerConnection.SetLocalDescription(answer); err != nil {
+		panic(err)
+	}
+
+	<-gatherComplete
+
+	msg, err = handle.Message(map[string]interface{}{
+		"request": "start",
+	}, map[string]interface{}{
+		"type": "answer",
+		"sdp": peerConnection.LocalDescription().SDP,
+		"trickle": false,
+	})
+
+	fmt.Printf("start msg: %+v\n", msg)
+	if err != nil {
+		panic(err)
+	}
+
+	select {}
+}
+
+func publishersToFeeds(publishers interface{}) ([]float64, error){
+	casted, ok := publishers.([]interface{})
+	if !ok {
+		return nil, errors.New("publishers not array")
+	}
+
+	var feeds []float64
+	for _, item := range casted {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, errors.New("publisher not map")
+		}
+		id, ok := m["id"].(float64)
+		if !ok {
+			return nil, errors.New("id not int")
+		}
+		feeds = append(feeds, id)
+	}
+	return feeds, nil
+}
+
+func createNewPeerConnection() *webrtc.PeerConnection {
 	// Prepare the configuration
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -58,10 +158,17 @@ func main() {
 		panic(err)
 	}
 
+	return peerConnection
+}
+
+func main() {
+	gst.Init(nil)
+	// Everything below is the Pion WebRTC API! Thanks for using it ❤️.
+	peerConnection := createNewPeerConnection()
+
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("Connection State has changed %s \n", connectionState.String())
 	})
-
 	// Create a audio track
 	opusTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "audio/opus"}, "audio", "pion")
 	if err != nil {
@@ -122,15 +229,27 @@ func main() {
 
 	go watchHandle(handle)
 
-	_, err = handle.Message(map[string]interface{}{
+	now := time.Now()
+	userId := now.UnixMilli() % (1 << 31) 
+	fmt.Printf("UserId: %+v\n", userId)
+	const roomId = 1234
+
+	joinMsg, err := handle.Message(map[string]interface{}{
 		"request": "join",
 		"ptype":   "publisher",
-		"room":    1234,
-		"id":      1,
+		"room":    roomId,
+		"id":      userId,
 	}, nil)
 	if err != nil {
 		panic(err)
 	}
+
+	publishers := joinMsg.Plugindata.Data["publishers"]
+	feeds, err := publishersToFeeds(publishers)
+	if err != nil {
+		panic(err)
+	}
+	go subscriber(session, roomId, feeds)
 
 	msg, err := handle.Message(map[string]interface{}{
 		"request": "publish",
@@ -161,10 +280,70 @@ func main() {
 
 		// Start pushing buffers on these tracks
 		pipelineForCodec("opus", []*webrtc.TrackLocalStaticSample{opusTrack}, "audiotestsrc")
-		pipelineForCodec("vp8", []*webrtc.TrackLocalStaticSample{vp8Track}, "videotestsrc")
+		// pipelineForCodec("vp8", []*webrtc.TrackLocalStaticSample{vp8Track}, "videotestsrc")
+		// pipelineAudio(opusTrack, "room.ogg")
+		pipelineVideo(vp8Track, "room.mkv")
 	}
 
 	select {}
+}
+
+func playPipeline(track *webrtc.TrackLocalStaticSample, pipeline *gst.Pipeline) {
+	err := pipeline.SetState(gst.StatePlaying)
+	if err != nil {
+		panic(err)
+	}
+
+	appSink, err := pipeline.GetElementByName("appsink")
+	if err != nil {
+		panic(err)
+	}
+
+	app.SinkFromElement(appSink).SetCallbacks(&app.SinkCallbacks{
+		NewSampleFunc: func(sink *app.Sink) gst.FlowReturn {
+			sample := sink.PullSample()
+			if sample == nil {
+				return gst.FlowEOS
+			}
+
+			buffer := sample.GetBuffer()
+			if buffer == nil {
+				return gst.FlowError
+			}
+
+			samples := buffer.Map(gst.MapRead).Bytes()
+			defer buffer.Unmap()
+
+			if err := track.WriteSample(media.Sample{Data: samples, Duration: *buffer.Duration().AsDuration()}); err != nil {
+				panic(err) //nolint
+			}
+
+			return gst.FlowOK
+		},
+	})
+
+}
+
+func pipelineVideo(track *webrtc.TrackLocalStaticSample, filename string) {
+	pipelineStr := fmt.Sprintf("filesrc location=%s ! matroskademux ! appsink name=appsink", filename)
+
+	pipeline, err := gst.NewPipelineFromString(pipelineStr)
+	if err != nil {
+		panic(err)
+	}
+
+	playPipeline(track, pipeline)
+}
+
+func pipelineAudio(track *webrtc.TrackLocalStaticSample, filename string) {
+	pipelineStr := fmt.Sprintf("filesrc location=%s ! oggdemux ! appsink name=appsink", filename)
+
+	pipeline, err := gst.NewPipelineFromString(pipelineStr)
+	if err != nil {
+		panic(err)
+	}
+
+	playPipeline(track, pipeline)
 }
 
 // Create the appropriate GStreamer pipeline depending on what codec we are working with
